@@ -1,352 +1,399 @@
-import express from "express";
-import cors from "cors";
-import crypto from "crypto";
-import Anthropic from "@anthropic-ai/sdk";
+import { useState, useEffect, useRef, useCallback } from "react";
 
-const app = express();
-app.use(cors());
-app.use(express.json());
+const API_BASE = "http://143.110.234.110:3000";
 
-let agentConfig = null;
-let agentInterval = null;
-let anthropic = null;
-let sseClients = [];
-
-const dailyStats = {
-  dailyTrades: 0,
-  dailyLoss: 0,
-  maxDailyLoss: 200,
-  maxDailyTrades: 20,
-  circuitBreakerActive: false,
+const C = {
+  bg: "#0a0c10", panel: "#0f1218", border: "#1c2230",
+  accent: "#00d4aa", accentDim: "#00d4aa22",
+  red: "#ff4d6d", redDim: "#ff4d6d22",
+  yellow: "#f4c542", blue: "#4d9fff",
+  text: "#e2e8f0", muted: "#64748b", subtle: "#1e2533",
 };
 
-function scheduleDailyReset() {
-  const now = new Date();
-  const midnight = new Date(now);
-  midnight.setHours(24, 0, 0, 0);
-  setTimeout(() => {
-    dailyStats.dailyTrades = 0;
-    dailyStats.dailyLoss = 0;
-    dailyStats.circuitBreakerActive = false;
-    broadcast("log", { time: new Date().toISOString(), level: "info", message: "Daily stats reset at midnight." });
-    scheduleDailyReset();
-  }, midnight - now);
-}
-scheduleDailyReset();
-
-function broadcast(event, data) {
-  const msg = "event: " + event + "\ndata: " + JSON.stringify(data) + "\n\n";
-  sseClients.forEach(function(res) { res.write(msg); });
+function mono(text, color) {
+  color = color || C.text;
+  return <span style={{ fontFamily: "monospace", color: color, fontSize: 12 }}>{text}</span>;
 }
 
-function log(level, message) {
-  console.log("[" + level.toUpperCase() + "] " + message);
-  broadcast("log", { time: new Date().toISOString(), level: level, message: message });
+function Badge({ label, color }) {
+  color = color || C.accent;
+  return (
+    <span style={{
+      background: color + "22", color: color, border: "1px solid " + color + "44",
+      borderRadius: 4, padding: "2px 8px", fontSize: 10,
+      fontFamily: "monospace", letterSpacing: 1, fontWeight: 700, textTransform: "uppercase",
+    }}>{label}</span>
+  );
 }
 
-const KRAKEN_BASE = "https://api.kraken.com";
-
-async function krakenPublic(path, params) {
-  if (!params) params = {};
-  const qs = new URLSearchParams(params).toString();
-  const url = KRAKEN_BASE + path + (qs ? "?" + qs : "");
-  const res = await fetch(url);
-  const json = await res.json();
-  if (json.error && json.error.length) {
-    throw new Error("Kraken error: " + json.error.join(", "));
-  }
-  return json.result;
+function Panel({ children, style }) {
+  style = style || {};
+  return (
+    <div style={{
+      background: C.panel, border: "1px solid " + C.border,
+      borderRadius: 12, padding: 20, ...style,
+    }}>{children}</div>
+  );
 }
 
-async function krakenPrivate(path, params) {
-  if (!params) params = {};
-  const apiKey = agentConfig.krakenApiKey;
-  const apiSecret = agentConfig.krakenApiSecret;
-  const nonce = Date.now().toString();
-  const body = new URLSearchParams(Object.assign({ nonce: nonce }, params)).toString();
-  const secret = Buffer.from(apiSecret, "base64");
-  const hash = crypto.createHash("sha256").update(nonce + body).digest("binary");
-  const hmac = crypto.createHmac("sha512", secret).update(path + hash, "binary").digest("base64");
-  const res = await fetch(KRAKEN_BASE + path, {
-    method: "POST",
-    headers: {
-      "API-Key": apiKey,
-      "API-Sign": hmac,
-      "Content-Type": "application/x-www-form-urlencoded",
-    },
-    body: body,
+function Stat({ label, value, color }) {
+  color = color || C.text;
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
+      <div style={{ fontSize: 10, color: C.muted, letterSpacing: 1, textTransform: "uppercase" }}>{label}</div>
+      <div style={{ fontSize: 18, fontWeight: 800, color: color }}>{value !== undefined ? value : "—"}</div>
+    </div>
+  );
+}
+
+function SetupForm({ onStart }) {
+  const [form, setForm] = useState({
+    krakenApiKey: "", krakenApiSecret: "", claudeApiKey: "",
+    pairs: "XBTUSD", intervalMinutes: "15", maxPositionUSD: "500",
+    maxRiskPercent: "2", maxDailyLossUSD: "200", maxDailyTrades: "20",
+    minConfidence: "0.65", riskProfile: "moderate", dryRun: true,
   });
-  const json = await res.json();
-  if (json.error && json.error.length) {
-    throw new Error("Kraken error: " + json.error.join(", "));
+
+  function set(k) {
+    return function(e) {
+      setForm(function(p) {
+        const v = e.target.type === "checkbox" ? e.target.checked : e.target.value;
+        return Object.assign({}, p, { [k]: v });
+      });
+    };
   }
-  return json.result;
-}
 
-async function getOHLCV(pair, interval) {
-  if (!interval) interval = 15;
-  const data = await krakenPublic("/0/public/OHLC", { pair: pair, interval: interval });
-  const key = Object.keys(data).find(function(k) { return k !== "last"; });
-  return data[key].slice(-50);
-}
-
-async function getTicker(pair) {
-  const data = await krakenPublic("/0/public/Ticker", { pair: pair });
-  const key = Object.keys(data)[0];
-  return data[key];
-}
-
-async function getBalance() {
-  return krakenPrivate("/0/private/Balance");
-}
-
-async function placeOrder(pair, type, volume) {
-  return krakenPrivate("/0/private/AddOrder", {
-    pair: pair,
-    type: type,
-    ordertype: "market",
-    volume: String(volume),
-  });
-}
-
-function calcRSI(closes, period) {
-  if (!period) period = 14;
-  if (closes.length < period + 1) return null;
-  let gains = 0;
-  let losses = 0;
-  for (let i = closes.length - period; i < closes.length; i++) {
-    const diff = closes[i] - closes[i - 1];
-    if (diff > 0) gains += diff;
-    else losses -= diff;
-  }
-  const rs = gains / (losses || 0.0001);
-  return 100 - 100 / (1 + rs);
-}
-
-function calcEMA(closes, period) {
-  const k = 2 / (period + 1);
-  let ema = closes[0];
-  for (let i = 1; i < closes.length; i++) {
-    ema = closes[i] * k + ema * (1 - k);
-  }
-  return ema;
-}
-
-function calcMACD(closes) {
-  const ema12 = calcEMA(closes.slice(-26), 12);
-  const ema26 = calcEMA(closes.slice(-26), 26);
-  return { macd: ema12 - ema26, ema12: ema12, ema26: ema26 };
-}
-
-function calcBB(closes, period) {
-  if (!period) period = 20;
-  const slice = closes.slice(-period);
-  const mean = slice.reduce(function(a, b) { return a + b; }, 0) / slice.length;
-  const std = Math.sqrt(slice.reduce(function(a, b) { return a + Math.pow(b - mean, 2); }, 0) / slice.length);
-  return { upper: mean + 2 * std, lower: mean - 2 * std, middle: mean };
-}
-
-function buildMarketSummary(pair, candles, ticker) {
-  const closes = candles.map(function(c) { return parseFloat(c[4]); });
-  const volumes = candles.map(function(c) { return parseFloat(c[6]); });
-  const rsi = calcRSI(closes);
-  const macdData = calcMACD(closes);
-  const bb = calcBB(closes);
-  const currentPrice = parseFloat(ticker.c[0]);
-  const avgVolume = volumes.slice(-10).reduce(function(a, b) { return a + b; }, 0) / 10;
-  const lastVolume = volumes[volumes.length - 1];
-  return {
-    pair: pair,
-    currentPrice: currentPrice,
-    rsi: rsi ? rsi.toFixed(2) : "n/a",
-    macd: macdData.macd.toFixed(4),
-    ema12: macdData.ema12.toFixed(2),
-    ema26: macdData.ema26.toFixed(2),
-    bbUpper: bb.upper.toFixed(2),
-    bbLower: bb.lower.toFixed(2),
-    bbMiddle: bb.middle.toFixed(2),
-    volRatio: (lastVolume / avgVolume).toFixed(2),
-    ask: ticker.a[0],
-    bid: ticker.b[0],
-    high: ticker.h[1],
-    low: ticker.l[1],
-    closes: closes.slice(-10).map(function(c) { return c.toFixed(2); }).join(","),
+  const inp = {
+    background: C.subtle, border: "1px solid " + C.border, borderRadius: 8,
+    color: C.text, padding: "10px 14px", width: "100%",
+    fontFamily: "monospace", fontSize: 13,
   };
+  const lbl = { fontSize: 11, color: C.muted, letterSpacing: 1, textTransform: "uppercase", marginBottom: 6, display: "block" };
+
+  return (
+    <div style={{ minHeight: "100vh", display: "flex", alignItems: "center", justifyContent: "center", padding: 40, background: C.bg }}>
+      <div style={{ width: "100%", maxWidth: 600 }}>
+        <div style={{ marginBottom: 40, textAlign: "center" }}>
+          <div style={{ fontSize: 11, color: C.accent, letterSpacing: 4, textTransform: "uppercase", marginBottom: 12 }}>◈ KRAKEN × CLAUDE</div>
+          <h1 style={{ fontSize: 36, fontWeight: 800, color: C.text, lineHeight: 1.1 }}>AI Trading Agent</h1>
+          <p style={{ color: C.muted, marginTop: 10, fontSize: 14 }}>Connect your accounts and configure the agent below</p>
+        </div>
+        <Panel>
+          <div style={{ display: "flex", flexDirection: "column", gap: 20 }}>
+            <div style={{ borderBottom: "1px solid " + C.border, paddingBottom: 20 }}>
+              <div style={{ fontSize: 13, color: C.accent, fontWeight: 600, marginBottom: 16 }}>API Credentials</div>
+              <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
+                {[["krakenApiKey","Kraken API Key","KrakenAPIKEY..."],["krakenApiSecret","Kraken API Secret","KrakenSecret..."],["claudeApiKey","Claude (Anthropic) API Key","sk-ant-..."]].map(function(item) {
+                  return (
+                    <div key={item[0]}>
+                      <label style={lbl}>{item[1]}</label>
+                      <input type="password" placeholder={item[2]} value={form[item[0]]} onChange={set(item[0])} style={inp} />
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
+            <div>
+              <div style={{ fontSize: 13, color: C.accent, fontWeight: 600, marginBottom: 16 }}>Trading Configuration</div>
+              <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12 }}>
+                <div style={{ gridColumn: "1 / -1" }}>
+                  <label style={lbl}>Trading Pairs (comma-separated)</label>
+                  <input value={form.pairs} onChange={set("pairs")} style={inp} placeholder="XBTUSD, ETHUSD" />
+                </div>
+                {[["intervalMinutes","Analysis Interval (min)","15"],["maxPositionUSD","Max Position Size (USD)","500"],["maxRiskPercent","Max Risk Per Trade (%)","2"],["maxDailyLossUSD","Daily Loss Limit (USD)","200"],["maxDailyTrades","Max Trades Per Day","20"],["minConfidence","Min Confidence (0-1)","0.65"]].map(function(item) {
+                  return (
+                    <div key={item[0]}>
+                      <label style={lbl}>{item[1]}</label>
+                      <input value={form[item[0]]} onChange={set(item[0])} style={inp} placeholder={item[2]} type="number" />
+                    </div>
+                  );
+                })}
+                <div>
+                  <label style={lbl}>Risk Profile</label>
+                  <select value={form.riskProfile} onChange={set("riskProfile")} style={inp}>
+                    <option value="conservative">Conservative</option>
+                    <option value="moderate">Moderate</option>
+                    <option value="aggressive">Aggressive</option>
+                  </select>
+                </div>
+              </div>
+            </div>
+            <div style={{
+              display: "flex", alignItems: "center", gap: 12,
+              background: form.dryRun ? C.accentDim : C.redDim,
+              border: "1px solid " + (form.dryRun ? C.accent : C.red) + "44",
+              borderRadius: 10, padding: "14px 16px",
+            }}>
+              <input type="checkbox" checked={form.dryRun} onChange={set("dryRun")} style={{ width: 18, height: 18, accentColor: C.accent }} />
+              <div>
+                <div style={{ fontWeight: 700, color: form.dryRun ? C.accent : C.red }}>
+                  {form.dryRun ? "📝 Paper Trading (Safe Mode)" : "💸 LIVE TRADING — Real Money"}
+                </div>
+                <div style={{ fontSize: 12, color: C.muted, marginTop: 2 }}>
+                  {form.dryRun ? "Simulates trades without using real funds." : "Warning: agent will place real orders on your Kraken account."}
+                </div>
+              </div>
+            </div>
+            <button onClick={function() {
+              onStart(Object.assign({}, form, {
+                pairs: form.pairs.split(",").map(function(s) { return s.trim(); }),
+                intervalMinutes: +form.intervalMinutes,
+                maxPositionUSD: +form.maxPositionUSD,
+                maxRiskPercent: +form.maxRiskPercent,
+                maxDailyLossUSD: +form.maxDailyLossUSD,
+                maxDailyTrades: +form.maxDailyTrades,
+                minConfidence: +form.minConfidence,
+              }));
+            }} style={{
+              background: C.accent, color: "#000", fontWeight: 800,
+              fontSize: 15, padding: "14px 24px", borderRadius: 10, border: "none", cursor: "pointer",
+            }}>
+              Launch Agent →
+            </button>
+          </div>
+        </Panel>
+      </div>
+    </div>
+  );
 }
 
-async function getClaudeDecision(md, cfg) {
-  const lines = [
-    "You are an expert crypto trading analyst.",
-    "Analyze this market data and reply with JSON only. No prose.",
-    "Pair: " + md.pair,
-    "Price: " + md.currentPrice,
-    "RSI: " + md.rsi,
-    "MACD: " + md.macd,
-    "EMA12: " + md.ema12 + " EMA26: " + md.ema26,
-    "BB Upper: " + md.bbUpper + " Middle: " + md.bbMiddle + " Lower: " + md.bbLower,
-    "Volume ratio: " + md.volRatio,
-    "24h High: " + md.high + " Low: " + md.low,
-    "Ask: " + md.ask + " Bid: " + md.bid,
-    "Last 10 closes: " + md.closes,
-    "Risk profile: " + cfg.riskProfile,
-    "Max position USD: " + cfg.maxPositionUSD,
-    "Max risk per trade %: " + cfg.maxRiskPercent,
-    "Return this exact JSON structure:",
-    "{",
-    '  "action": "buy" or "sell" or "hold",',
-    '  "confidence": number between 0 and 1,',
-    '  "reason": "one sentence string",',
-    '  "signals": ["signal1", "signal2"],',
-    '  "size_usd": number,',
-    '  "stop_loss_pct": number,',
-    '  "take_profit_pct": number',
-    "}",
-  ];
-  const response = await anthropic.messages.create({
-    model: "claude-sonnet-4-20250514",
-    max_tokens: 512,
-    messages: [{ role: "user", content: lines.join("\n") }],
-  });
-  const raw = response.content[0].text.trim().replace(/```json|```/g, "").trim();
-  return JSON.parse(raw);
+function LogFeed({ logs }) {
+  const ref = useRef(null);
+  useEffect(function() { if (ref.current) ref.current.scrollTop = 0; }, [logs.length]);
+  const lvlColor = { info: C.accent, warn: C.yellow, error: C.red, debug: C.muted };
+  return (
+    <div ref={ref} style={{ height: 240, overflowY: "auto", display: "flex", flexDirection: "column", gap: 5 }}>
+      {logs.length === 0
+        ? <div style={{ color: C.muted, fontSize: 12, fontFamily: "monospace" }}>Waiting for agent activity...</div>
+        : logs.map(function(log, i) {
+          return (
+            <div key={i} style={{ display: "flex", gap: 10, fontSize: 11, fontFamily: "monospace", lineHeight: 1.5 }}>
+              <span style={{ color: C.muted, flexShrink: 0 }}>{new Date(log.time).toLocaleTimeString()}</span>
+              <span style={{ color: lvlColor[log.level] || C.text, flexShrink: 0, width: 40 }}>[{(log.level || "").toUpperCase()}]</span>
+              <span style={{ color: C.text }}>{log.message}</span>
+            </div>
+          );
+        })}
+    </div>
+  );
 }
 
-async function executeOrder(pair, decision, price) {
-  const sizeUSD = Math.min(decision.size_usd || agentConfig.maxPositionUSD, agentConfig.maxPositionUSD);
-  const volume = (sizeUSD / price).toFixed(8);
-  const tradeRecord = {
-    type: decision.action,
-    pair: pair,
-    price: price,
-    volume: volume,
-    usd_value: sizeUSD,
-    reason: decision.reason,
-    simulated: agentConfig.dryRun,
-    timestamp: new Date().toISOString(),
-  };
-  if (agentConfig.dryRun) {
-    log("info", "[PAPER] " + decision.action.toUpperCase() + " " + volume + " " + pair + " @ $" + price);
-    sendTelegram("📝 PAPER TRADE\n" + decision.action.toUpperCase() + " " + volume + " " + pair + " @ $" + price + "\nReason: " + decision.reason);
-  } else {
-    try {
-      log("info", "[LIVE] Placing " + decision.action.toUpperCase() + " order for " + volume + " " + pair);
-      const result = await placeOrder(pair, decision.action, volume);
-      tradeRecord.orderId = result.txid && result.txid[0];
-      log("info", "Order placed successfully: " + tradeRecord.orderId);
-      sendTelegram("💰 LIVE TRADE PLACED\n" + decision.action.toUpperCase() + " " + volume + " " + pair + " @ $" + price + "\nValue: $" + sizeUSD + "\nConfidence: " + Math.round(decision.confidence * 100) + "%\nReason: " + decision.reason);
-    } catch (err) {
-      log("error", "Order failed: " + err.message);
-      sendTelegram("🚨 ORDER FAILED\nPair: " + pair + "\nError: " + err.message);
-      return;
-    }
-  }
-  dailyStats.dailyTrades++;
-  broadcast("trade", tradeRecord);
+function DecisionCard({ pair, decision }) {
+  if (!decision) return null;
+  const ac = { buy: C.accent, sell: C.red, hold: C.yellow }[decision.action] || C.text;
+  return (
+    <div style={{ background: ac + "11", border: "1px solid " + ac + "33", borderRadius: 10, padding: 16 }}>
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", marginBottom: 10 }}>
+        <div>
+          <div style={{ fontSize: 11, color: C.muted, letterSpacing: 1 }}>{pair}</div>
+          <div style={{ fontSize: 22, fontWeight: 800, color: ac, textTransform: "uppercase" }}>{decision.action}</div>
+        </div>
+        <div style={{ textAlign: "right" }}>
+          <div style={{ fontSize: 11, color: C.muted }}>Confidence</div>
+          <div style={{ fontSize: 20, fontWeight: 800, color: ac }}>{(decision.confidence * 100).toFixed(0)}%</div>
+        </div>
+      </div>
+      <div style={{ fontSize: 12, color: C.muted, marginBottom: 8 }}>{decision.reason}</div>
+      {decision.signals && (
+        <div style={{ display: "flex", flexWrap: "wrap", gap: 4 }}>
+          {decision.signals.map(function(s, i) { return <Badge key={i} label={s} color={ac} />; })}
+        </div>
+      )}
+      {decision.size_usd > 0 && (
+        <div style={{ marginTop: 10, display: "flex", gap: 16, fontSize: 11, fontFamily: "monospace" }}>
+          <span style={{ color: C.muted }}>Size: <span style={{ color: C.text }}>${decision.size_usd}</span></span>
+          <span style={{ color: C.muted }}>SL: <span style={{ color: C.red }}>{decision.stop_loss_pct}%</span></span>
+          <span style={{ color: C.muted }}>TP: <span style={{ color: C.accent }}>{decision.take_profit_pct}%</span></span>
+        </div>
+      )}
+      <div style={{ fontSize: 10, color: C.muted, marginTop: 8 }}>{new Date(decision.timestamp).toLocaleTimeString()}</div>
+    </div>
+  );
 }
 
-async function runCycle() {
-  if (!agentConfig) return;
-  if (dailyStats.circuitBreakerActive) {
-    log("warn", "Circuit breaker active - skipping cycle.");
-    return;
-  }
-  for (const pair of agentConfig.pairs) {
-    try {
-      log("info", "[" + pair + "] Fetching market data...");
-      const candles = await getOHLCV(pair, agentConfig.intervalMinutes);
-      const ticker = await getTicker(pair);
-      const md = buildMarketSummary(pair, candles, ticker);
-      log("info", "[" + pair + "] Price $" + md.currentPrice + " RSI:" + md.rsi + " MACD:" + md.macd);
-      log("info", "[" + pair + "] Asking Claude for decision...");
-      const decision = await getClaudeDecision(md, agentConfig);
-      decision.pair = pair;
-      decision.timestamp = new Date().toISOString();
-      broadcast("decision", { pair: pair, decision: decision });
-      log("info", "[" + pair + "] " + decision.action.toUpperCase() + " @ " + Math.round(decision.confidence * 100) + "% - " + decision.reason);
-      const canTrade = decision.action !== "hold"
-        && decision.confidence >= agentConfig.minConfidence
-        && dailyStats.dailyTrades < agentConfig.maxDailyTrades;
-      if (canTrade) {
-        await executeOrder(pair, decision, md.currentPrice);
-      } else if (decision.action !== "hold") {
-        log("warn", "[" + pair + "] Skipped - confidence too low or daily limit reached");
-      }
-    } catch (err) {
-      log("error", "[" + pair + "] Cycle error: " + err.message);
-    }
-  }
-  try {
-    if (!agentConfig.dryRun) {
-      const bal = await getBalance();
-      broadcast("portfolio", bal);
-    }
-  } catch (e) {}
-  broadcast("status", { dailyStats: dailyStats });
+function TradeRow({ trade }) {
+  const isBuy = trade.type === "buy";
+  return (
+    <div style={{
+      display: "grid", gridTemplateColumns: "auto 1fr auto auto auto",
+      gap: 12, alignItems: "center", padding: "10px 0",
+      borderBottom: "1px solid " + C.border, fontSize: 12,
+    }}>
+      <Badge label={trade.type} color={isBuy ? C.accent : C.red} />
+      <div>
+        <div style={{ fontWeight: 600 }}>{trade.pair}</div>
+        <div style={{ fontSize: 10, color: C.muted }}>{(trade.reason || "").slice(0, 40)}</div>
+      </div>
+      {mono("$" + parseFloat(trade.price || 0).toFixed(2), C.text)}
+      {mono("$" + parseFloat(trade.usd_value || 0).toFixed(2), C.accent)}
+      {trade.simulated && <Badge label="paper" color={C.muted} />}
+    </div>
+  );
 }
 
-app.get("/api/stream", function(req, res) {
-  res.setHeader("Content-Type", "text/event-stream");
-  res.setHeader("Cache-Control", "no-cache");
-  res.setHeader("Connection", "keep-alive");
-  res.flushHeaders();
-  sseClients.push(res);
-  log("debug", "SSE client connected. Total: " + sseClients.length);
-  req.on("close", function() {
-    sseClients = sseClients.filter(function(c) { return c !== res; });
-  });
-});
+function Dashboard({ config, onStop }) {
+  const [logs, setLogs] = useState([]);
+  const [trades, setTrades] = useState([]);
+  const [decisions, setDecisions] = useState({});
+  const [portfolio, setPortfolio] = useState(null);
+  const [connected, setConnected] = useState(false);
+  const [dailyStats, setDailyStats] = useState(null);
+  const esRef = useRef(null);
 
-app.post("/api/start", async function(req, res) {
-  if (agentInterval) clearInterval(agentInterval);
-  agentConfig = req.body;
-  if (!agentConfig.claudeApiKey) {
-    return res.status(400).json({ error: "Claude API key required" });
-  }
-  anthropic = new Anthropic({ apiKey: agentConfig.claudeApiKey });
-  dailyStats.maxDailyLoss = agentConfig.maxDailyLossUSD;
-  dailyStats.maxDailyTrades = agentConfig.maxDailyTrades;
-  log("info", "Agent started - pairs: " + agentConfig.pairs.join(", ") + " | mode: " + (agentConfig.dryRun ? "PAPER" : "LIVE"));
-  runCycle();
-  agentInterval = setInterval(runCycle, agentConfig.intervalMinutes * 60 * 1000);
-  res.json({ message: "Agent started" });
-});
+  const addLog = useCallback(function(entry) {
+    setLogs(function(p) { return [entry, ...p].slice(0, 200); });
+  }, []);
 
-app.post("/api/stop", function(req, res) {
-  if (agentInterval) clearInterval(agentInterval);
-  agentInterval = null;
-  agentConfig = null;
-  log("info", "Agent stopped.");
-  res.json({ message: "Agent stopped" });
-});
-
-app.post("/api/run-cycle", function(req, res) {
-  runCycle();
-  res.json({ message: "Cycle triggered" });
-});
-
-app.get("/api/status", function(req, res) {
-  res.json({ running: !!agentConfig, dailyStats: dailyStats, config: agentConfig });
-});
-
-// ── Telegram Alerts ───────────────────────────────────────────────────────────
-const TELEGRAM_TOKEN = "8445957862:AAGyEV7tiRsENjOkQ5bbxn0-3DABAMQ_rj4";
-const TELEGRAM_CHAT_ID = "8695847775";
-
-async function sendTelegram(message) {
-  try {
-    const url = "https://api.telegram.org/bot" + TELEGRAM_TOKEN + "/sendMessage";
-    await fetch(url, {
+  useEffect(function() {
+    fetch(API_BASE + "/api/start", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ chat_id: TELEGRAM_CHAT_ID, text: message, parse_mode: "HTML" }),
+      body: JSON.stringify(config),
+    })
+      .then(function(r) { return r.json(); })
+      .then(function(d) {
+        addLog({ time: new Date().toISOString(), level: "info", message: "Agent started: " + d.message });
+      })
+      .catch(function() {
+        addLog({ time: new Date().toISOString(), level: "error", message: "Cannot reach agent server at " + API_BASE });
+      });
+
+    const es = new EventSource(API_BASE + "/api/stream");
+    esRef.current = es;
+    es.onopen = function() { setConnected(true); };
+    es.onerror = function() { setConnected(false); };
+    es.addEventListener("log", function(e) { addLog(JSON.parse(e.data)); });
+    es.addEventListener("status", function(e) {
+      const d = JSON.parse(e.data);
+      setDailyStats(d.dailyStats);
     });
-  } catch (err) {
-    console.log("Telegram error: " + err.message);
+    es.addEventListener("trade", function(e) {
+      setTrades(function(p) { return [JSON.parse(e.data), ...p].slice(0, 100); });
+    });
+    es.addEventListener("decision", function(e) {
+      const d = JSON.parse(e.data);
+      setDecisions(function(p) { return Object.assign({}, p, { [d.pair]: d.decision }); });
+    });
+    es.addEventListener("portfolio", function(e) { setPortfolio(JSON.parse(e.data)); });
+
+    const poll = setInterval(function() {
+      fetch(API_BASE + "/api/status").then(function(r) { return r.json(); }).then(function(d) {
+        if (d.dailyStats) setDailyStats(d.dailyStats);
+      }).catch(function() {});
+    }, 10000);
+
+    return function() { es.close(); clearInterval(poll); };
+  }, []);
+
+  function handleStop() {
+    fetch(API_BASE + "/api/stop", { method: "POST" }).catch(function() {});
+    if (esRef.current) esRef.current.close();
+    onStop();
   }
+
+  function handleRunNow() {
+    fetch(API_BASE + "/api/run-cycle", { method: "POST" }).catch(function() {});
+    addLog({ time: new Date().toISOString(), level: "info", message: "Manual cycle triggered" });
+  }
+
+  const isLive = !config.dryRun;
+
+  return (
+    <div style={{ minHeight: "100vh", background: C.bg, padding: 24 }}>
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 24, flexWrap: "wrap", gap: 12 }}>
+        <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
+          <div style={{ fontSize: 20, fontWeight: 800, color: C.text }}>⬡ Kraken AI Agent</div>
+          <Badge label={isLive ? "LIVE" : "PAPER"} color={isLive ? C.red : C.yellow} />
+          <Badge label={connected ? "CONNECTED" : "DISCONNECTED"} color={connected ? C.accent : C.red} />
+        </div>
+        <div style={{ display: "flex", gap: 10 }}>
+          <button onClick={handleRunNow} style={{
+            background: C.subtle, color: C.text, borderRadius: 8,
+            padding: "8px 16px", fontSize: 13, fontWeight: 600, border: "none", cursor: "pointer",
+          }}>↺ Run Now</button>
+          <button onClick={handleStop} style={{
+            background: C.redDim, color: C.red, border: "1px solid " + C.red + "44",
+            borderRadius: 8, padding: "8px 16px", fontSize: 13, fontWeight: 600, cursor: "pointer",
+          }}>■ Stop Agent</button>
+        </div>
+      </div>
+
+      <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(150px, 1fr))", gap: 16, marginBottom: 24 }}>
+        <Panel><Stat label="Daily Trades" value={dailyStats ? dailyStats.dailyTrades : "—"} /></Panel>
+        <Panel><Stat label="Daily Loss" value={dailyStats ? "$" + dailyStats.dailyLoss.toFixed(2) : "—"} /></Panel>
+        <Panel><Stat label="Loss Limit" value={dailyStats ? "$" + dailyStats.maxDailyLoss : "—"} color={C.muted} /></Panel>
+        <Panel><Stat label="Pairs" value={config.pairs ? config.pairs.join(", ") : "—"} color={C.accent} /></Panel>
+        <Panel><Stat label="Interval" value={config.intervalMinutes + "m"} /></Panel>
+        <Panel><Stat label="Max Position" value={"$" + config.maxPositionUSD} /></Panel>
+      </div>
+
+      {dailyStats && dailyStats.circuitBreakerActive && (
+        <Panel style={{ marginBottom: 20, borderColor: C.red + "55", background: C.redDim }}>
+          <div style={{ fontWeight: 800, color: C.red, fontSize: 16 }}>🔴 CIRCUIT BREAKER ACTIVE — Trading halted for today</div>
+          <div style={{ color: C.muted, marginTop: 6, fontSize: 13 }}>Daily loss limit reached. Will reset at midnight.</div>
+        </Panel>
+      )}
+
+      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 20, marginBottom: 20 }}>
+        <Panel>
+          <div style={{ fontSize: 13, color: C.accent, fontWeight: 600, marginBottom: 16 }}>🤖 CLAUDE DECISIONS</div>
+          <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
+            {Object.keys(decisions).length === 0
+              ? <div style={{ color: C.muted, fontSize: 12, fontFamily: "monospace" }}>Waiting for first analysis cycle...</div>
+              : Object.entries(decisions).map(function(entry) {
+                return <DecisionCard key={entry[0]} pair={entry[0]} decision={entry[1]} />;
+              })}
+          </div>
+        </Panel>
+        <Panel>
+          <div style={{ fontSize: 13, color: C.accent, fontWeight: 600, marginBottom: 16 }}>💼 PORTFOLIO BALANCES</div>
+          {portfolio ? (
+            <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+              {Object.entries(portfolio).filter(function(e) { return parseFloat(e[1]) > 0.00001; }).map(function(e) {
+                return (
+                  <div key={e[0]} style={{ display: "flex", justifyContent: "space-between", alignItems: "center", padding: "8px 0", borderBottom: "1px solid " + C.border }}>
+                    <span style={{ fontWeight: 600, color: C.text }}>{e[0]}</span>
+                    {mono(parseFloat(e[1]).toFixed(8), C.accent)}
+                  </div>
+                );
+              })}
+            </div>
+          ) : (
+            <div style={{ color: C.muted, fontSize: 12, fontFamily: "monospace" }}>Fetching balances...</div>
+          )}
+        </Panel>
+      </div>
+
+      <Panel style={{ marginBottom: 20 }}>
+        <div style={{ fontSize: 13, color: C.accent, fontWeight: 600, marginBottom: 16 }}>📋 TRADE HISTORY</div>
+        {trades.length === 0
+          ? <div style={{ color: C.muted, fontSize: 12, fontFamily: "monospace" }}>No trades yet this session.</div>
+          : trades.map(function(t, i) { return <TradeRow key={i} trade={t} />; })}
+      </Panel>
+
+      <Panel>
+        <div style={{ fontSize: 13, color: C.accent, fontWeight: 600, marginBottom: 16 }}>📡 AGENT LOGS</div>
+        <LogFeed logs={logs} />
+      </Panel>
+
+      <Panel style={{ marginTop: 20 }}>
+        <div style={{ fontSize: 13, color: C.muted, fontWeight: 600, marginBottom: 12 }}>ACTIVE CONFIGURATION</div>
+        <pre style={{ fontFamily: "monospace", fontSize: 11, color: C.muted, whiteSpace: "pre-wrap", lineHeight: 1.6 }}>
+          {JSON.stringify({
+            pairs: config.pairs, intervalMinutes: config.intervalMinutes,
+            maxPositionUSD: config.maxPositionUSD, maxRiskPercent: config.maxRiskPercent,
+            maxDailyLossUSD: config.maxDailyLossUSD, minConfidence: config.minConfidence,
+            riskProfile: config.riskProfile, dryRun: config.dryRun,
+          }, null, 2)}
+        </pre>
+      </Panel>
+    </div>
+  );
 }
 
-const PORT = 3000;
-app.listen(PORT, function() {
-  console.log("\n🤖 Kraken AI Agent running on http://localhost:" + PORT + "\n");
-  sendTelegram("🤖 Kraken AI Agent started and running on cloud server!");
-});
+export default function App() {
+  const [config, setConfig] = useState(null);
+  return config
+    ? <Dashboard config={config} onStop={function() { setConfig(null); }} />
+    : <SetupForm onStart={setConfig} />;
+}
