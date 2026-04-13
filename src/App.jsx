@@ -47,11 +47,12 @@ function Stat({ label, value, color }) {
 }
 
 function SetupForm({ onStart }) {
+  const saved = (() => { try { return JSON.parse(localStorage.getItem("kraken_config") || "{}"); } catch(e) { return {}; } })();
   const [form, setForm] = useState({
-    krakenApiKey: "", krakenApiSecret: "", claudeApiKey: "",
-    pairs: "XBTUSD", intervalMinutes: "15", maxPositionUSD: "500",
-    maxRiskPercent: "2", maxDailyLossUSD: "200", maxDailyTrades: "20",
-    minConfidence: "0.65", riskProfile: "moderate", dryRun: true,
+    krakenApiKey: saved.krakenApiKey || "", krakenApiSecret: saved.krakenApiSecret || "", claudeApiKey: saved.claudeApiKey || "",
+    pairs: saved.pairs || "XBTUSD", intervalMinutes: saved.intervalMinutes || "15", maxPositionUSD: saved.maxPositionUSD || "500",
+    maxRiskPercent: saved.maxRiskPercent || "2", maxDailyLossUSD: saved.maxDailyLossUSD || "200", maxDailyTrades: saved.maxDailyTrades || "20",
+    minConfidence: saved.minConfidence || "0.65", riskProfile: saved.riskProfile || "moderate", dryRun: saved.dryRun !== undefined ? saved.dryRun : true,
   });
 
   function set(k) {
@@ -135,7 +136,7 @@ function SetupForm({ onStart }) {
               </div>
             </div>
             <button onClick={function() {
-              onStart(Object.assign({}, form, {
+              const cfg = Object.assign({}, form, {
                 pairs: form.pairs.split(",").map(function(s) { return s.trim(); }),
                 intervalMinutes: +form.intervalMinutes,
                 maxPositionUSD: +form.maxPositionUSD,
@@ -143,7 +144,9 @@ function SetupForm({ onStart }) {
                 maxDailyLossUSD: +form.maxDailyLossUSD,
                 maxDailyTrades: +form.maxDailyTrades,
                 minConfidence: +form.minConfidence,
-              }));
+              });
+              try { localStorage.setItem("kraken_config", JSON.stringify(form)); } catch(e) {}
+              onStart(cfg);
             }} style={{
               background: C.accent, color: "#000", fontWeight: 800,
               fontSize: 15, padding: "14px 24px", borderRadius: 10, border: "none", cursor: "pointer",
