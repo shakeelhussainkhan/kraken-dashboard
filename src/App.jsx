@@ -1,6 +1,6 @@
 import { useState, useEffect, useRef, useCallback } from "react";
 
-const API_BASE = "http://143.110.234.110:3000";
+const API_BASE = "https://143.110.234.110.nip.io";
 
 const C = {
   bg: "#0a0c10", panel: "#0f1218", border: "#1c2230",
