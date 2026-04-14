@@ -1,5 +1,9 @@
 {
   "buildCommand": "npm run build",
   "outputDirectory": "dist",
-  "framework": "vite" 
+  "framework": "vite",
+  "routes": [
+    { "src": "/robinhood.html", "dest": "/robinhood.html" },
+    { "src": "/(.*)", "dest": "/index.html" }
+  ]
 }
