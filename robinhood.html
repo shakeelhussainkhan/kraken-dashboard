@@ -1,0 +1,65 @@
+Last login: Tue Apr 14 10:35:54 on ttys000
+
+The default interactive shell is now zsh.
+To update your account to use zsh, please run `chsh -s /bin/zsh`.
+For more details, please visit https://support.apple.com/kb/HT208050.
+Shakeels-MacBook-Air:~ ShakeelHussainKhan$ ssh root@143.110.234.110
+root@143.110.234.110's password: 
+Welcome to Ubuntu 24.04.3 LTS (GNU/Linux 6.8.0-71-generic x86_64)
+
+ * Documentation:  https://help.ubuntu.com
+ * Management:     https://landscape.canonical.com
+ * Support:        https://ubuntu.com/pro
+
+ System information as of Tue Apr 14 18:12:34 UTC 2026
+
+  System load:  0.0                Processes:             102
+  Usage of /:   12.6% of 23.17GB   Users logged in:       0
+  Memory usage: 33%                IPv4 address for eth0: 143.110.234.110
+  Swap usage:   0%                 IPv4 address for eth0: 10.48.0.5
+
+Expanded Security Maintenance for Applications is not enabled.
+
+72 updates can be applied immediately.
+To see these additional updates run: apt list --upgradable
+
+Enable ESM Apps to receive additional future security updates.
+See https://ubuntu.com/esm or run: sudo pro status
+
+
+*** System restart required ***
+Last login: Tue Apr 14 17:36:09 2026 from 76.132.252.37
+root@ubuntu-s-1vcpu-1gb-sfo3-01:~# nano /etc/nginx/sites-enabled/default
+root@ubuntu-s-1vcpu-1gb-sfo3-01:~# systemctl restart nginx
+root@ubuntu-s-1vcpu-1gb-sfo3-01:~# curl -X POST https://143.110.234.110.nip.io/rh/start -H "Content-Type: application/json" -d '{"rhUsername":"test","rhPassword":"test","claudeApiKey":"test"}' -v 2>&1 | head -30
+Note: Unnecessary use of -X or --request, POST is already inferred.
+  % Total    % Received % Xferd  Average Speed   Time    Time     Time  Current
+                                 Dload  Upload   Total   Spent    Left  Speed
+  0     0    0     0    0     0      0      0 --:--:-- --:--:-- --:--:--     0* Host 143.110.234.110.nip.io:443 was resolved.
+* IPv6: (none)
+* IPv4: 143.110.234.110
+  0     0    0     0    0     0      0      0 --:--:-- --:--:-- --:--:--     0*   Trying 143.110.234.110:443...
+* Connected to 143.110.234.110.nip.io (143.110.234.110) port 443
+* ALPN: curl offers h2,http/1.1
+} [5 bytes data]
+* TLSv1.3 (OUT), TLS handshake, Client hello (1):
+} [512 bytes data]
+*  CAfile: /etc/ssl/certs/ca-certificates.crt
+*  CApath: /etc/ssl/certs
+{ [5 bytes data]
+* TLSv1.3 (IN), TLS handshake, Server hello (2):
+{ [122 bytes data]
+* TLSv1.3 (IN), TLS handshake, Encrypted Extensions (8):
+{ [25 bytes data]
+* TLSv1.3 (IN), TLS handshake, Certificate (11):
+{ [2056 bytes data]
+* TLSv1.3 (IN), TLS handshake, CERT verify (15):
+{ [78 bytes data]
+* TLSv1.3 (IN), TLS handshake, Finished (20):
+{ [52 bytes data]
+* TLSv1.3 (OUT), TLS change cipher, Change cipher spec (1):
+} [1 bytes data]
+* TLSv1.3 (OUT), TLS handshake, Finished (20):
+} [52 bytes data]
+* SSL connection using TLSv1.3 / TLS_AES_256_GCM_SHA384 / X25519 / id-ecPublicKey
+root@ubuntu-s-1vcpu-1gb-sfo3-01:~# 
